@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Générateur de QR code</title>
+<style>
+  :root { --bg:#f4f6fb; --card:#fff; --text:#1c2333; --muted:#6b7488; --accent:#2f5bea; --border:#dde2ee; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:24px;
+          width:100%; max-width:420px; box-shadow:0 6px 24px rgba(20,30,60,.08); }
+  h1 { font-size:1.3rem; margin:0 0 4px; }
+  p.sub { margin:0 0 18px; color:var(--muted); font-size:.9rem; }
+  label { display:block; font-size:.85rem; font-weight:600; margin-bottom:6px; }
+  input[type=text] { width:100%; padding:12px; font-size:1rem; border:1px solid var(--border); border-radius:10px; }
+  input[type=text]:focus { outline:2px solid var(--accent); border-color:transparent; }
+  .info { font-size:.8rem; color:var(--muted); margin-top:6px; min-height:1.1em; }
+  .info.err { color:#c62828; }
+  .qr-box { margin:18px 0; display:flex; justify-content:center; }
+  canvas { max-width:100%; height:auto; border:1px solid var(--border); border-radius:8px; image-rendering:pixelated; }
+  button { width:100%; padding:12px; font-size:1rem; font-weight:600; color:#fff; background:var(--accent);
+           border:0; border-radius:10px; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .hint { margin-top:12px; font-size:.78rem; color:var(--muted); text-align:center; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Générateur de QR code</h1>
+  <p class="sub">Le texte saisi est encodé directement dans le QR code, sans serveur.</p>
+
+  <label for="texte">Nom ou texte</label>
+  <input type="text" id="texte" autocomplete="off" autofocus>
+  <div class="info" id="info"></div>
+
+  <div class="qr-box"><canvas id="qr" width="0" height="0"></canvas></div>
+
+  <button id="dl" disabled>Télécharger en PNG</button>
+  <div class="hint">Scanne avec l'appareil photo du téléphone : le texte exact s'affiche.</div>
+</div>
+
+<script>
+
+const VERSIONS = [
+  null,
+  [10, [[1,16]]],
+  [16, [[1,28]]],
+  [26, [[1,44]]],
+  [18, [[2,32]]],
+  [24, [[2,43]]],
+  [16, [[4,27]]],
+  [18, [[4,31]]],
+  [22, [[2,38],[2,39]]],
+  [22, [[3,36],[2,37]]],
+  [26, [[4,43],[1,44]]]
+];
+const ALIGN = [null, [], [6,18], [6,22], [6,26], [6,30], [6,34], [6,22,38], [6,24,42], [6,26,46], [6,28,50]];
+
+
+const EXP = new Array(512), LOG = new Array(256);
+(function () {
+  let x = 1;
+  for (let i = 0; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & 256) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+})();
+const gmul = (a, b) => (a === 0 || b === 0) ? 0 : EXP[LOG[a] + LOG[b]];
+
+function rsGenerator(deg) {
+  let poly = [1];
+  for (let i = 0; i < deg; i++) {
+    const next = new Array(poly.length + 1).fill(0);
+    for (let j = 0; j < poly.length; j++) {
+      next[j] ^= poly[j];
+      next[j + 1] ^= gmul(poly[j], EXP[i]);
+    }
+    poly = next;
+  }
+  return poly;
+}
+function rsRemainder(data, deg) {
+  const gen = rsGenerator(deg);
+  const res = new Array(deg).fill(0);
+  for (const b of data) {
+    const factor = b ^ res.shift();
+    res.push(0);
+    if (factor !== 0) for (let i = 0; i < deg; i++) res[i] ^= gmul(gen[i + 1], factor);
+  }
+  return res;
+}
+
+function utf8Bytes(str) { return Array.from(new TextEncoder().encode(str)); }
+
+function dataCapacity(v) {
+  const [, groups] = VERSIONS[v];
+  return groups.reduce((s, [n, d]) => s + n * d, 0);
+}
+
+function chooseVersion(len) {
+  for (let v = 1; v <= 10; v++) {
+    const countBits = v < 10 ? 8 : 16;
+    if (4 + countBits + len * 8 <= dataCapacity(v) * 8) return v;
+  }
+  return -1;
+}
+
+function buildCodewords(bytes, v) {
+  const capBits = dataCapacity(v) * 8;
+  const bits = [];
+  const push = (val, n) => { for (let i = n - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
+  push(0b0100, 4);
+  push(bytes.length, v < 10 ? 8 : 16);
+  bytes.forEach(b => push(b, 8));
+  push(0, Math.min(4, capBits - bits.length));
+  while (bits.length % 8) bits.push(0);
+  const data = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let b = 0; for (let j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+    data.push(b);
+  }
+  for (let pad = 0xEC; data.length < dataCapacity(v); pad ^= 0xEC ^ 0x11) data.push(pad);
+
+  const [ecLen, groups] = VERSIONS[v];
+  const blocks = [];
+  let pos = 0;
+  for (const [n, d] of groups) {
+    for (let i = 0; i < n; i++) {
+      const blk = data.slice(pos, pos + d); pos += d;
+      blocks.push({ data: blk, ec: rsRemainder(blk, ecLen) });
+    }
+  }
+  const out = [];
+  const maxD = Math.max(...blocks.map(b => b.data.length));
+  for (let i = 0; i < maxD; i++) blocks.forEach(b => { if (i < b.data.length) out.push(b.data[i]); });
+  for (let i = 0; i < ecLen; i++) blocks.forEach(b => out.push(b.ec[i]));
+  return out;
+}
+
+function makeMatrix(v, codewords, mask) {
+  const size = 17 + 4 * v;
+  const m = Array.from({ length: size }, () => new Array(size).fill(false));
+  const fn = Array.from({ length: size }, () => new Array(size).fill(false));
+  const set = (x, y, val) => { m[y][x] = val; fn[y][x] = true; };
+
+  const finder = (cx, cy) => {
+    for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+      const x = cx + dx, y = cy + dy;
+      if (x < 0 || y < 0 || x >= size || y >= size) continue;
+      const d = Math.max(Math.abs(dx), Math.abs(dy));
+      set(x, y, d !== 2 && d !== 4);
+    }
+  };
+  finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
+
+  for (let i = 0; i < size; i++) { if (!fn[6][i]) set(i, 6, i % 2 === 0); if (!fn[i][6]) set(6, i, i % 2 === 0); }
+
+  const ap = ALIGN[v];
+  for (const cy of ap) for (const cx of ap) {
+    if ((cx === 6 && cy === 6) || (cx === 6 && cy === ap[ap.length - 1]) || (cx === ap[ap.length - 1] && cy === 6)) continue;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++)
+      set(cx + dx, cy + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }
+
+  for (let i = 0; i < 9; i++) { fn[8][i] = true; fn[i][8] = true; }
+  for (let i = 0; i < 8; i++) { fn[8][size - 1 - i] = true; fn[size - 1 - i][8] = true; }
+  if (v >= 7) for (let i = 0; i < 18; i++) {
+    const a = size - 11 + (i % 3), b = Math.floor(i / 3);
+    fn[b][a] = true; fn[a][b] = true;
+  }
+
+  const bits = [];
+  codewords.forEach(c => { for (let i = 7; i >= 0; i--) bits.push((c >>> i) & 1); });
+  let k = 0;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert++) for (let j = 0; j < 2; j++) {
+      const x = right - j;
+      const y = (((right + 1) & 2) === 0) ? size - 1 - vert : vert;
+      if (!fn[y][x]) { m[y][x] = k < bits.length ? bits[k] === 1 : false; k++; }
+    }
+  }
+
+  const maskFn = [
+    (x, y) => (x + y) % 2 === 0,
+    (x, y) => y % 2 === 0,
+    (x, y) => x % 3 === 0,
+    (x, y) => (x + y) % 3 === 0,
+    (x, y) => (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0,
+    (x, y) => (x * y) % 2 + (x * y) % 3 === 0,
+    (x, y) => ((x * y) % 2 + (x * y) % 3) % 2 === 0,
+    (x, y) => ((x + y) % 2 + (x * y) % 3) % 2 === 0
+  ][mask];
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++)
+    if (!fn[y][x] && maskFn(x, y)) m[y][x] = !m[y][x];
+
+  let rem = mask;
+  for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+  const fbits = ((mask << 10) | rem) ^ 0x5412;
+  const fb = i => ((fbits >>> i) & 1) === 1;
+  for (let i = 0; i <= 5; i++) set(8, i, fb(i));
+  set(8, 7, fb(6)); set(8, 8, fb(7)); set(7, 8, fb(8));
+  for (let i = 9; i < 15; i++) set(14 - i, 8, fb(i));
+  for (let i = 0; i < 8; i++) set(size - 1 - i, 8, fb(i));
+  for (let i = 8; i < 15; i++) set(8, size - 15 + i, fb(i));
+  set(8, size - 8, true);
+
+  if (v >= 7) {
+    let r = v;
+    for (let i = 0; i < 12; i++) r = (r << 1) ^ ((r >>> 11) * 0x1F25);
+    const vbits = (v << 12) | r;
+    for (let i = 0; i < 18; i++) {
+      const bit = ((vbits >>> i) & 1) === 1;
+      const a = size - 11 + (i % 3), b = Math.floor(i / 3);
+      set(a, b, bit); set(b, a, bit);
+    }
+  }
+  return m;
+}
+
+function penalty(m) {
+  const n = m.length;
+  let p = 0, dark = 0;
+  const line = arr => {
+    let run = 1;
+    for (let i = 1; i < n; i++) {
+      if (arr[i] === arr[i - 1]) { run++; if (run === 5) p += 3; else if (run > 5) p++; }
+      else run = 1;
+    }
+  };
+  for (let i = 0; i < n; i++) {
+    line(m[i]); line(m.map(r => r[i]));
+    for (let j = 0; j < n; j++) if (m[i][j]) dark++;
+  }
+  for (let y = 0; y < n - 1; y++) for (let x = 0; x < n - 1; x++)
+    if (m[y][x] === m[y][x + 1] && m[y][x] === m[y + 1][x] && m[y][x] === m[y + 1][x + 1]) p += 3;
+  const pat = [1,0,1,1,1,0,1,0,0,0,0], rpat = pat.slice().reverse();
+  const match = (get, i, j, q) => q.every((b, k) => (get(i, j + k) ? 1 : 0) === b);
+  for (let i = 0; i < n; i++) for (let j = 0; j <= n - 11; j++) {
+    if (match((a, b) => m[a][b], i, j, pat) || match((a, b) => m[a][b], i, j, rpat)) p += 40;
+    if (match((a, b) => m[b][a], i, j, pat) || match((a, b) => m[b][a], i, j, rpat)) p += 40;
+  }
+  p += Math.floor(Math.abs(dark * 20 - n * n * 10) / (n * n)) * 10;
+  return p;
+}
+
+function genererQR(texte) {
+  const bytes = utf8Bytes(texte);
+  const v = chooseVersion(bytes.length);
+  if (v < 0) return null;
+  const cw = buildCodewords(bytes, v);
+  let best = null, bestP = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    const mat = makeMatrix(v, cw, mask);
+    const p = penalty(mat);
+    if (p < bestP) { bestP = p; best = mat; }
+  }
+  return best;
+}
+
+if (typeof document !== 'undefined') {
+  const input = document.getElementById('texte');
+  const canvas = document.getElementById('qr');
+  const info = document.getElementById('info');
+  const dl = document.getElementById('dl');
+  const MAX_BYTES = 213;
+
+  function dessiner() {
+    const texte = input.value.trim();
+    const ctx = canvas.getContext('2d');
+    info.classList.remove('err');
+    if (!texte) {
+      canvas.width = canvas.height = 0; dl.disabled = true; info.textContent = ''; return;
+    }
+    const mat = genererQR(texte);
+    if (!mat) {
+      canvas.width = canvas.height = 0; dl.disabled = true;
+      info.textContent = 'Texte trop long (maximum ' + MAX_BYTES + ' octets).';
+      info.classList.add('err'); return;
+    }
+    const quiet = 4, n = mat.length, cell = Math.max(4, Math.floor(320 / (n + quiet * 2)));
+    const px = (n + quiet * 2) * cell;
+    canvas.width = canvas.height = px;
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, px, px);
+    ctx.fillStyle = '#000';
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++)
+      if (mat[y][x]) ctx.fillRect((x + quiet) * cell, (y + quiet) * cell, cell, cell);
+    dl.disabled = false;
+    info.textContent = utf8Bytes(texte).length + ' / ' + MAX_BYTES + ' octets';
+  }
+
+  input.addEventListener('input', dessiner);
+  dl.addEventListener('click', () => {
+    const a = document.createElement('a');
+    const nom = input.value.trim().replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 30) || 'qr';
+    a.download = 'qr-' + nom + '.png';
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  });
+}
+</script>
+</body>
+</html>
